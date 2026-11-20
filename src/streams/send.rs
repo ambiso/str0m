@@ -947,8 +947,13 @@ impl StreamTx {
                 // is a headroom since we can accept slightly larger padding than asked for.
                 let max_size = (self.padding * 2).min(self.mtu_warn - MAX_RTP_OVERHEAD);
 
-                let Some(pkt) = self.rtx_cache.get_cached_packet_smaller_than(max_size) else {
-                    // Couldn't find spurious packet, try a blank packet instead.
+                // Fill each padding packet efficiently, including on quiet video.
+                let min_size = self.padding.min(MAX_BLANK_PADDING_PAYLOAD_SIZE);
+                let Some(pkt) = self
+                    .rtx_cache
+                    .get_cached_packet_smaller_than(max_size)
+                    .filter(|pkt| pkt.payload.len() >= min_size)
+                else {
                     break 'outer;
                 };
 
@@ -1461,6 +1466,37 @@ mod test {
         // The five queued packets are 0, 10, 20, 30 and 40 ms old.
         assert_eq!(snapshot.packet_count, 5);
         assert_eq!(snapshot.total_queue_time(now), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn padding_uses_full_packets_when_the_cached_payload_is_smaller() {
+        let now = Instant::now();
+        let seq_no = 42.into();
+        for (size, expected) in [
+            (40, NextPacketKind::Blank(240)),
+            (500, NextPacketKind::Resend(seq_no)),
+        ] {
+            let mut stream = StreamTx::new(
+                1.into(),
+                Some(2.into()),
+                MidRid("vid".into(), None),
+                false,
+                1200,
+            );
+            stream.pt_for_padding = Some(96.into());
+            stream.rtx_cache.cache_sent_packet(
+                RtpPacket {
+                    seq_no,
+                    payload: vec![0; size].into(),
+                    nackable: true,
+                    timestamp: now,
+                    ..RtpPacket::blank()
+                },
+                now,
+            );
+            stream.generate_padding(480);
+            assert_eq!(stream.poll_packet_padding(now).unwrap().kind, expected);
+        }
     }
 
     #[test]
