@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::Pacer;
 use super::PaddingRequest;
-use super::QueueState;
+use super::{QueuePriority, QueueState};
 use crate::Reason;
 use crate::bwe_::ProbeClusterConfig;
 use crate::bwe_::ProbeClusterState;
@@ -288,8 +288,14 @@ impl LeakyBucketPacer {
             if self.adjusted_bitrate > Bitrate::ZERO {
                 // Check if we're actively probing and should use probe-specific timing
                 let poll_at = if let Some(probe) = self.probe_queue.front() {
-                    // During probe: use absolute time directly from probe state
-                    (probe.next_probe_time(), PacerReason::Probe1)
+                    // Poll the queued packets of this padding burst before scheduling
+                    // the next one. The probe already sized the burst for its interval.
+                    let at = if queue.snapshot.priority == QueuePriority::Padding {
+                        now
+                    } else {
+                        probe.next_probe_time()
+                    };
+                    (at, PacerReason::Probe1)
                 } else {
                     // Normal pacing: use relative offset based on debt
                     let drain_debt_time = self.media_debt / self.adjusted_bitrate;
@@ -506,14 +512,27 @@ mod test {
         pacer.handle_timeout(now, std::iter::once(queue));
         pacer.start_probe(ProbeClusterConfig::new(
             0.into(),
-            Bitrate::kbps(300),
+            Bitrate::kbps(1_600),
             ProbeKind::Initial,
         ));
         let request = pacer.handle_timeout(now, std::iter::once(queue)).unwrap();
         let (midrid, cluster) = pacer.poll_queue().unwrap();
         assert_eq!(cluster, Some(0.into()));
-        pacer.register_send(now, request.padding.into(), midrid);
-        assert!(pacer.handle_timeout(now, std::iter::once(queue)).is_none());
+        let remainder = request.padding - 240;
+        pacer.register_send(now, 240_usize.into(), midrid);
+        let next = pacer.poll_timeout().0.unwrap();
+        let mut remaining = queue;
+        remaining.snapshot.packet_count = 1;
+        remaining.snapshot.byte_size = remainder;
+        remaining.snapshot.priority = QueuePriority::Padding;
+        assert!(
+            pacer
+                .handle_timeout(next, std::iter::once(remaining))
+                .is_none()
+        );
+        assert_eq!(pacer.poll_queue(), Some((midrid, Some(0.into()))));
+        pacer.register_send(next, remainder.into(), midrid);
+        assert!(pacer.handle_timeout(next, std::iter::once(queue)).is_none());
         let deadline = pacer.poll_timeout().0.unwrap();
         assert!(deadline > now && deadline <= now + Duration::from_millis(10));
         assert!(pacer.poll_queue().is_none());
