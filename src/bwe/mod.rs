@@ -197,7 +197,15 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
+        let previous_estimate = self.last_estimate();
+        for (config, bitrate, saturated) in
+            self.probe_estimator.update(send_records.iter().copied())
+        {
+            // A probe the receiver kept up with only establishes a lower bound.
+            if !saturated && previous_estimate.is_some_and(|previous| bitrate < previous) {
+                continue;
+            }
+
             latest_probe_result = Some(bitrate);
 
             // Update link capacity estimator for every successful ALR probe, not just the latest.
@@ -508,6 +516,36 @@ impl fmt::Display for BandwidthUsage {
 mod test {
     use super::*;
     use crate::rtp_::TwccPacketId;
+
+    #[test]
+    fn unsaturated_probes_establish_a_lower_bound() {
+        use crate::bwe_::probe::ProbeKind;
+
+        for (previous_mbps, receive_interval, expected_kbps) in
+            [(10, 4, 10_000), (1, 4, 2_400), (10, 8, 1_140)]
+        {
+            let start = Instant::now();
+            let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(previous_mbps));
+            let probe =
+                ProbeClusterConfig::new(1.into(), Bitrate::mbps(15), ProbeKind::PeriodicAlr);
+            assert!(bwe.start_probe(probe, start));
+            let feedback_at = start + Duration::from_millis(300);
+            let records: Vec<_> = (0..32_u64)
+                .map(|i| {
+                    TwccSendRecord::test_new(
+                        TwccPacketId::with_cluster(i, probe.cluster()),
+                        start + Duration::from_millis(i * 4),
+                        1200,
+                        feedback_at,
+                        Some(start + Duration::from_millis(10 + i * receive_interval)),
+                    )
+                })
+                .collect();
+            bwe.update(records.iter(), feedback_at);
+            let estimate = bwe.last_estimate().unwrap();
+            assert_eq!(estimate.as_u64(), expected_kbps * 1000);
+        }
+    }
 
     #[test]
     fn alr_probing_waits_for_nonempty_transport_feedback() {
