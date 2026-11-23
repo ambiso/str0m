@@ -27,7 +27,6 @@ const BITRATE_DROP_THRESHOLD: f64 = 0.66;
 const BITRATE_DROP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_FRACTION_AFTER_DROP: f64 = 0.85;
 const PROBE_UNCERTAINTY: f64 = 0.05;
-const ALR_ENDED_TIMEOUT: Duration = Duration::from_secs(3);
 const MIN_TIME_BETWEEN_ALR_PROBES: Duration = Duration::from_secs(5);
 
 /// WebRTC: inline `* 2` in probe_controller.cc InitiateProbing().
@@ -418,7 +417,7 @@ impl ProbeControl {
     ///    500 kbps × 1.5 = 750 kbps maximum
     /// 5. Sending at 500 kbps = 71% of estimate, which is above ALR threshold (65%)
     /// 6. ALR never triggers → no periodic probing
-    /// 7. Large-drop probe requires ALR or recent ALR exit (see `maybe_large_drop`)
+    /// 7. Large-drop probe fires only within 5 seconds of a drop (see `maybe_large_drop`)
     /// 8. System is stuck: estimate ~700 kbps on a 5 Mbps network
     ///
     /// **AIMD's 1.5× Cap (line 191 in rate_control.rs):**
@@ -438,10 +437,10 @@ impl ProbeControl {
     ///
     /// ## How This Differs from WebRTC
     ///
-    /// WebRTC does not have stagnation-based probing. They rely on:
-    /// 1. Large-drop recovery probe (requires ALR or recent ALR exit)
-    /// 2. Rapid recovery field trial (`WebRTC-BweRapidRecoveryExperiment`) which removes
-    ///    the ALR requirement from large-drop probes
+    /// WebRTC does not have stagnation-based probing. It relies on the large-drop
+    /// recovery probe, which requires ALR or a recent ALR exit unless the rapid recovery
+    /// field trial (`WebRTC-BweRapidRecoveryExperiment`) removes that requirement, as
+    /// str0m does.
     ///
     /// str0m adds stagnant probing as a complementary mechanism that:
     /// - Catches deadlock regardless of whether a drop was detected
@@ -516,10 +515,9 @@ impl ProbeControl {
             return false;
         }
 
-        // Large-drop probing requires ALR context (in ALR or recently exited).
-        if !self.in_alr() && !self.alr_ended_recently(now) {
-            return false;
-        }
+        // Outside ALR too, as libwebrtc's WebRTC-BweRapidRecoveryExperiment: a
+        // burst such as a key frame can cut the estimate while the sender is
+        // not application limited, and AIMD then climbs back for tens of seconds.
 
         // Respect minimum interval between ALR probes.
         if self.time_since_last_probe(now) < MIN_TIME_BETWEEN_ALR_PROBES {
@@ -611,12 +609,6 @@ impl ProbeControl {
 
     fn in_alr(&self) -> bool {
         self.alr_start.is_some() && self.alr_stop.is_none()
-    }
-
-    fn alr_ended_recently(&self, now: Instant) -> bool {
-        self.alr_stop
-            .map(|stop| now.saturating_duration_since(stop) < ALR_ENDED_TIMEOUT)
-            .unwrap_or(false)
     }
 
     fn is_during_initial(&self, now: Instant) -> bool {
@@ -1008,7 +1000,7 @@ mod test {
         // Simulate large drop (to 60% of original = 3 Mbps, below 66% threshold)
         pc.set_estimated_bitrate(Bitrate::mbps(3), BandwidthLimitedCause::DelayBasedLimited);
 
-        // Check at now+5s (within 3s of ALR ending, so alr_ended_recently is true)
+        // Check at now+5s, two seconds after ALR ended
         let later = now + Duration::from_secs(5);
 
         // Should trigger large-drop recovery probe at 85% of pre-drop rate (4.25 Mbps)
@@ -1019,6 +1011,26 @@ mod test {
             assert!(probe.target_bitrate() >= Bitrate::mbps(4));
             assert!(probe.target_bitrate() <= Bitrate::mbps(5));
         }
+    }
+
+    #[test]
+    fn large_drop_probing_outside_alr() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+
+        pc.set_desired_bitrate(Bitrate::mbps(20));
+        pc.set_estimated_bitrate(Bitrate::mbps(20), BandwidthLimitedCause::DelayBasedLimited);
+        let _ = pc.handle_timeout(now);
+        let _ = pc.handle_timeout(now);
+        assert!(pc.handle_timeout(now + Duration::from_secs(2)).is_none());
+
+        // A key frame burst cuts the estimate while the sender is not in ALR.
+        pc.set_estimated_bitrate(Bitrate::kbps(300), BandwidthLimitedCause::DelayBasedLimited);
+        let p = pc.handle_timeout(now + Duration::from_secs(6));
+        let probe = p.expect("a recovery probe without ALR");
+        // 85% of 20 Mbps.
+        assert_eq!(probe.target_bitrate(), Bitrate::mbps(17));
     }
 
     #[test]
