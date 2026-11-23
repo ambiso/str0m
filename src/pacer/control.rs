@@ -1,6 +1,8 @@
 use crate::rtp_::Bitrate;
 
-const PACING_FACTOR: f64 = 1.1;
+/// libwebrtc's default pace multiplier (`kDefaultPaceMultiplier`): a burst such
+/// as a key frame drains at 2.5 times the estimate.
+const PACING_FACTOR: f64 = 2.5;
 
 /// Automatic padding target when media is active. This maintains NAT bindings, RTX state,
 /// and allows ALR periodic probes to discover higher bandwidth.
