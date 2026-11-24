@@ -1080,6 +1080,21 @@ impl UserExtensionValues {
             map.remove(&TypeId::of::<T>());
         }
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map.as_ref().is_none_or(|map| map.is_empty())
+    }
+}
+
+/// A packet's place in the frame it carries. The payloader sets it on each packet of a
+/// frame written with user extension values, for serializers whose value differs per
+/// packet, such as the AV1 Dependency Descriptor's start and end of frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacketPosition {
+    /// The frame's first packet.
+    pub first: bool,
+    /// The frame's last packet.
+    pub last: bool,
 }
 
 impl UnwindSafe for UserExtensionValues {}

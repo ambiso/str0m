@@ -3,7 +3,7 @@ use std::time::Instant;
 use crate::format::{CodecSpec, Vp9PacketizerMode};
 use crate::media::ToPayload;
 use crate::rtp::vla::VideoLayersAllocation;
-use crate::rtp_::{ExtensionValues, Frequency, Pt, SeqNo};
+use crate::rtp_::{ExtensionValues, Frequency, PacketPosition, Pt, SeqNo};
 use crate::streams::{RtpWrite, StreamTx};
 
 use super::PacketError;
@@ -104,6 +104,10 @@ impl Payloader {
                 pkt_ext_vals.video_orientation = None;
                 pkt_ext_vals.video_content_type = None;
                 pkt_ext_vals.video_timing = None;
+            }
+
+            if !pkt_ext_vals.user_values.is_empty() {
+                pkt_ext_vals.user_values.set(PacketPosition { first, last });
             }
 
             let rtp_time_u32 = rtp_time.rebase(self.clock_rate).numer() as u32;
