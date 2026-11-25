@@ -247,7 +247,7 @@ impl Bwe {
             }
         }
         self.smoother
-            .record_for(now, self.send_rate, SEND_RATE_IDLE);
+            .record_sustained(now, self.send_rate, SEND_RATE_IDLE);
     }
 
     pub fn poll_estimate(&mut self) -> Option<Bitrate> {
