@@ -40,6 +40,7 @@ pub struct LeakyBucketPacer {
     padding_debt: DataSize,
     /// The longest the average packet can spend in the queue before we force it to be drained.
     queue_limit: Duration,
+    burst_interval: Duration,
     /// The queue states given by last handle_timeout.
     queue_states: Vec<QueueState>,
     /// The next return value for `poll_queue``
@@ -177,12 +178,18 @@ impl LeakyBucketPacer {
             media_debt: DataSize::ZERO,
             padding_debt: DataSize::ZERO,
             queue_limit: DEFAULT_QUEUE_LIMIT,
+            burst_interval: PACING,
             queue_states: vec![],
             next_poll_queue: None,
             probe_queue: VecDeque::new(),
             completed_probe: None,
             needs_timeout_before_next_poll: true,
         }
+    }
+
+    pub(crate) fn with_burst_interval(mut self, interval: Duration) -> Self {
+        self.burst_interval = interval;
+        self
     }
 
     /// Start executing a probe cluster.
@@ -301,7 +308,9 @@ impl LeakyBucketPacer {
                     let drain_debt_time = self.media_debt / self.adjusted_bitrate;
                     // Limit the burst to MAX_BURST_SIZE so high bitrates don't overfill socket
                     // buffers. Below ~12.6 Mbps this is PACING.
-                    let burst_interval = PACING.min(MAX_BURST_SIZE / self.adjusted_bitrate);
+                    let burst_interval = self
+                        .burst_interval
+                        .min(MAX_BURST_SIZE / self.adjusted_bitrate);
                     let next_send_offset = if drain_debt_time >= burst_interval {
                         // If we have incurred too much debt, wait for it to clear before sending.
                         // again.

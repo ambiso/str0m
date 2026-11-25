@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::Reason;
 use crate::bwe_::ProbeClusterConfig;
@@ -23,8 +23,14 @@ pub(crate) enum PacerImpl {
 }
 
 impl PacerImpl {
-    pub fn leaky_bucket(rate: Bitrate) -> PacerImpl {
-        PacerImpl::LeakyBucket(LeakyBucketPacer::new(rate))
+    pub fn leaky_bucket(rate: Bitrate, short_bursts: bool) -> PacerImpl {
+        let pacer = LeakyBucketPacer::new(rate);
+        let pacer = if short_bursts {
+            pacer.with_burst_interval(Duration::from_millis(5))
+        } else {
+            pacer
+        };
+        PacerImpl::LeakyBucket(pacer)
     }
 
     pub fn null() -> PacerImpl {

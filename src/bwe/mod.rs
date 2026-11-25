@@ -54,12 +54,29 @@ pub(crate) use probe::ProbeClusterConfig;
 const INITIAL_BITRATE_WINDOW: Duration = Duration::from_millis(500);
 const BITRATE_WINDOW: Duration = Duration::from_millis(150);
 const STARTUP_PHASE: Duration = Duration::from_secs(2);
+const SEND_RATE_WINDOW: Duration = Duration::from_millis(400);
+const SEND_RATE_QUEUE_GROWTH: Duration = Duration::from_millis(8);
+const SEND_RATE_CHECK: Duration = Duration::from_millis(125);
+const SEND_RATE_RETRY: Duration = Duration::from_secs(5);
+const SEND_RATE_IDLE: Duration = Duration::from_secs(1);
+const SEND_RATE_STEP: f64 = 1.16;
+const DELIVERY_TRIAL_HEADROOM: f64 = 1.65;
+const PROBED_DELIVERY_HEADROOM: f64 = 2.5;
+const DELIVERY_RESUME_HEADROOM: f64 = 1.4;
+const PROBE_HEADROOM: f64 = 1.2;
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
     desired_bitrate: Bitrate,
     minimum_bitrate: Bitrate,
     smoother: EstimateSmoother,
+    sustained_delivery: bool,
+    send_rate: Bitrate,
+    delivery: Option<DeliveryWindow>,
+    confirmed: Option<Bitrate>,
+    active_delivery: Option<(Instant, Bitrate)>,
+    trial_base: Option<Bitrate>,
+    next_trial: Option<Instant>,
 }
 
 impl Bwe {
@@ -70,13 +87,37 @@ impl Bwe {
             desired_bitrate: Bitrate::ZERO,
             minimum_bitrate: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
+            sustained_delivery: false,
+            send_rate: initial,
+            delivery: None,
+            confirmed: None,
+            active_delivery: None,
+            trial_base: None,
+            next_trial: None,
         }
     }
 
+    pub fn with_sustained_delivery(mut self, enabled: bool) -> Self {
+        self.sustained_delivery = enabled;
+        self
+    }
+
     pub fn handle_timeout(&mut self, now: Instant, do_probe: bool) -> Option<ProbeClusterConfig> {
+        if self.sustained_delivery
+            && self
+                .bwe
+                .started_at
+                .is_some_and(|start| now.saturating_duration_since(start) > STARTUP_PHASE)
+        {
+            self.bwe
+                .probe_control
+                .set_ceiling((self.send_rate * PROBE_HEADROOM).max(Bitrate::mbps(1)));
+        }
         let result = self.bwe.handle_timeout(self.desired_bitrate, do_probe, now);
-        if let Some(estimate) = self.bwe.last_estimate() {
-            self.smoother.record(now, estimate);
+        if self.sustained_delivery {
+            self.update_send_rate(None, None, now);
+        } else if let Some(rate) = self.bwe.last_estimate() {
+            self.smoother.record(now, rate);
         }
         result
     }
@@ -91,6 +132,15 @@ impl Bwe {
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        if self.sustained_delivery {
+            self.send_rate = init_bitrate;
+            self.delivery = None;
+            self.confirmed = None;
+            self.active_delivery = None;
+            self.trial_base = None;
+            self.next_trial = None;
+            self.smoother = EstimateSmoother::new();
+        }
     }
 
     pub fn update<'t>(
@@ -98,7 +148,106 @@ impl Bwe {
         records: impl Iterator<Item = &'t crate::rtp_::TwccSendRecord>,
         now: Instant,
     ) {
-        self.bwe.update(records, now);
+        if !self.sustained_delivery {
+            self.bwe.update(records, now);
+            return;
+        }
+
+        let mut delivered = None;
+        let mut ordinary_packets = 0;
+        let mut lost_packets = 0;
+        let probe = self.bwe.update(
+            records.inspect(|record| {
+                if record.cluster().is_some() {
+                    return;
+                }
+                ordinary_packets += 1;
+                if let Some(at) = record.remote_recv_time() {
+                    delivered = record_delivery(
+                        &mut self.delivery,
+                        record.local_send_time(),
+                        at,
+                        record.size().into(),
+                        self.send_rate,
+                    )
+                    .or(delivered);
+                } else {
+                    lost_packets += 1;
+                }
+            }),
+            now,
+        );
+        if lost_packets >= 2 && lost_packets * 50 >= ordinary_packets {
+            delivered = Some(Delivery::Congested);
+            self.delivery = None;
+        }
+        self.update_send_rate(delivered, probe, now);
+    }
+
+    fn update_send_rate(&mut self, sample: Option<Delivery>, probe: Option<Bitrate>, now: Instant) {
+        let Some(estimate) = self.bwe.last_estimate() else {
+            return;
+        };
+        if in_startup_phase(self.bwe.started_at, now) || self.desired_bitrate.is_zero() {
+            self.send_rate = estimate;
+            self.delivery = None;
+            self.trial_base = None;
+        } else {
+            let mut delivery_cap = Bitrate::ZERO;
+            match sample {
+                Some(Delivery::Congested) => {
+                    // Leave room for the queue to drain and delay retrying a failed trial.
+                    let trial = self.trial_base.take();
+                    self.send_rate =
+                        (trial.unwrap_or(self.send_rate) * 0.85).max(Bitrate::kbps(40));
+                    self.confirmed = None;
+                    self.active_delivery = None;
+                    if trial.is_some() {
+                        self.next_trial = Some(now + SEND_RATE_RETRY);
+                    }
+                }
+                Some(Delivery::Rate(delivered))
+                    if delivered * PROBED_DELIVERY_HEADROOM >= self.send_rate =>
+                {
+                    self.active_delivery = Some((now, delivered));
+                    delivery_cap = delivered * DELIVERY_TRIAL_HEADROOM;
+                    let supported = self.send_rate.min(delivered * DELIVERY_RESUME_HEADROOM);
+                    self.confirmed =
+                        Some(self.confirmed.map_or(supported, |rate| rate.max(supported)));
+                    if delivery_cap >= self.send_rate {
+                        self.trial_base = None;
+                    }
+                }
+                _ => {}
+            }
+            let active = self
+                .active_delivery
+                .filter(|(at, _)| now.saturating_duration_since(*at) < SEND_RATE_IDLE);
+            if let Some((_, delivered)) = active {
+                // An encoder can underfill its budget. A fresh probe lets it try
+                // a small increase during motion, with a cap based on media use.
+                let probe_cap = probe.map_or(Bitrate::ZERO, |rate| {
+                    (rate * 0.95).min(delivered * PROBED_DELIVERY_HEADROOM)
+                });
+                if self.next_trial.is_none_or(|retry| now >= retry) {
+                    let target = (self.send_rate * SEND_RATE_STEP)
+                        .min(delivery_cap.max(probe_cap))
+                        .min(self.desired_bitrate);
+                    if target > self.send_rate {
+                        self.trial_base = Some(self.send_rate);
+                        self.send_rate = target;
+                    }
+                }
+            } else if let Some(confirmed) = self.confirmed
+                && confirmed < self.send_rate
+            {
+                // Resume at the last supported rate after a quiet period.
+                self.send_rate = confirmed;
+                self.trial_base = None;
+            }
+        }
+        self.smoother
+            .record_for(now, self.send_rate, SEND_RATE_IDLE);
     }
 
     pub fn poll_estimate(&mut self) -> Option<Bitrate> {
@@ -110,7 +259,11 @@ impl Bwe {
     }
 
     pub fn last_estimate(&self) -> Option<Bitrate> {
-        self.bwe.last_estimate()
+        if self.sustained_delivery {
+            Some(self.send_rate)
+        } else {
+            self.bwe.last_estimate()
+        }
     }
 
     pub fn on_media_sent(&mut self, payload_size: DataSize, is_padding: bool, now: Instant) {
@@ -132,6 +285,58 @@ impl Bwe {
     pub fn minimum_bitrate(&self) -> Bitrate {
         self.minimum_bitrate
     }
+}
+
+struct DeliveryWindow {
+    sent: Instant,
+    received: Instant,
+    bytes: DataSize,
+    queue_grew: bool,
+}
+
+#[derive(Clone, Copy)]
+enum Delivery {
+    Rate(Bitrate),
+    Congested,
+}
+
+fn record_delivery(
+    window: &mut Option<DeliveryWindow>,
+    sent: Instant,
+    received: Instant,
+    bytes: DataSize,
+    send_rate: Bitrate,
+) -> Option<Delivery> {
+    let previous = window.get_or_insert(DeliveryWindow {
+        sent,
+        received,
+        bytes: DataSize::ZERO,
+        queue_grew: false,
+    });
+    // Feedback can arrive out of order.
+    let send_span = sent.checked_duration_since(previous.sent)?;
+    let receive_span = received.checked_duration_since(previous.received)?;
+    // A comparison of relative transit times works even when the two clocks
+    // have different origins. Check rising delay before a full rate sample.
+    let queue_grew = send_span >= SEND_RATE_CHECK
+        && receive_span > send_span + SEND_RATE_QUEUE_GROWTH
+        && previous.bytes / send_span >= send_rate * 0.35;
+    let sample = if queue_grew {
+        // Confirm increasing delay in adjacent windows before reducing the rate.
+        previous.queue_grew.then_some(Delivery::Congested)
+    } else if send_span >= SEND_RATE_WINDOW {
+        Some(Delivery::Rate(previous.bytes / send_span.max(receive_span)))
+    } else {
+        previous.bytes += bytes;
+        return None;
+    };
+    *previous = DeliveryWindow {
+        sent,
+        received,
+        bytes,
+        queue_grew,
+    };
+    sample
 }
 
 struct SendSideBandwidthEstimator {
@@ -188,19 +393,27 @@ impl SendSideBandwidthEstimator {
     }
 
     /// Record a packet from a TWCC report.
-    pub fn update<'t>(&mut self, records: impl Iterator<Item = &'t TwccSendRecord>, now: Instant) {
+    pub fn update<'t>(
+        &mut self,
+        records: impl Iterator<Item = &'t TwccSendRecord>,
+        now: Instant,
+    ) -> Option<Bitrate> {
         let send_records: Vec<_> = records.collect();
         if send_records.is_empty() {
-            return;
+            return None;
         }
         let _ = self.started_at.get_or_insert(now);
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
+        let mut clean_probe = None;
         let previous_estimate = self.last_estimate();
         for (config, bitrate, saturated) in
             self.probe_estimator.update(send_records.iter().copied())
         {
+            if !saturated {
+                clean_probe = Some(bitrate.min(config.target_bitrate()));
+            }
             // A probe the receiver kept up with only establishes a lower bound.
             if !saturated && previous_estimate.is_some_and(|previous| bitrate < previous) {
                 continue;
@@ -251,7 +464,7 @@ impl SendSideBandwidthEstimator {
                 .update(&acked_packets, acked_bitrate, probe_result, now);
 
         let Some(delay_estimate) = maybe_estimate else {
-            return;
+            return clean_probe;
         };
 
         let loss = if count == 0 {
@@ -264,7 +477,7 @@ impl SendSideBandwidthEstimator {
         // During startup with no loss, use delay-based estimate directly
         if in_startup_phase(self.started_at, now) && loss <= 0.001 {
             self.loss_controller.set_bandwidth_estimate(delay_estimate);
-            return;
+            return clean_probe;
         }
 
         // When probe succeeds, set bandwidth directly
@@ -292,6 +505,8 @@ impl SendSideBandwidthEstimator {
 
         // Feed the (possibly combined) estimate into subcomponents wanting it.
         self.propagate_estimate();
+
+        clean_probe
     }
 
     pub fn poll_timeout(&self) -> (Option<Instant>, Reason) {

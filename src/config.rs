@@ -44,6 +44,7 @@ pub struct RtcConfig {
     pub(crate) stats_interval: Option<Duration>,
     pub(crate) intervals: RtcpReportIntervals,
     pub(crate) bwe_config: Option<BweConfig>,
+    pub(crate) bwe_sustained_delivery: bool,
     pub(crate) reordering_size_audio: usize,
     pub(crate) reordering_size_video: usize,
     pub(crate) reordering_timeout_audio: Option<Duration>,
@@ -500,6 +501,15 @@ impl RtcConfig {
         self.bwe_config.as_ref().map(|c| c.initial_bitrate)
     }
 
+    /// Increase the BWE send budget in steps confirmed by sustained delivery.
+    ///
+    /// Enable for a sender whose encoder can adapt its rate continuously.
+    /// Defaults to false.
+    pub fn set_bwe_sustained_delivery(mut self, enabled: bool) -> Self {
+        self.bwe_sustained_delivery = enabled;
+        self
+    }
+
     /// Sets the number of packets held back for reordering audio packets.
     ///
     /// Str0m tries to deliver the frames in order. This number determines how many
@@ -896,6 +906,7 @@ impl Default for RtcConfig {
                 video: Duration::from_secs(1),
             },
             bwe_config: None,
+            bwe_sustained_delivery: false,
             reordering_size_audio: 15,
             reordering_size_video: 30,
             reordering_timeout_audio: Some(Duration::from_secs(1)),

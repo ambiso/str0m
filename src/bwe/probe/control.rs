@@ -58,6 +58,7 @@ pub struct ProbeControl {
     enabled: bool,
 
     desired_bitrate: Option<Bitrate>,
+    ceiling: Bitrate,
     prev_desired: Option<Bitrate>,
 
     last_estimate: Option<Bitrate>,
@@ -103,6 +104,7 @@ impl Default for ProbeControl {
             enabled: false,
             next_timeout: not_happening(),
             desired_bitrate: None,
+            ceiling: Bitrate::INFINITY,
             prev_desired: None,
             last_estimate: None,
             last_estimate_change: None,
@@ -146,6 +148,14 @@ impl ProbeControl {
             self.scheduled_stagnant = None;
             self.next_timeout = not_happening();
         }
+    }
+
+    pub fn set_ceiling(&mut self, ceiling: Bitrate) {
+        if ceiling < self.ceiling {
+            self.pending
+                .retain(|probe| probe.target_bitrate() <= ceiling);
+        }
+        self.ceiling = ceiling;
     }
 
     pub fn set_desired_bitrate(&mut self, v: Bitrate) {
@@ -324,7 +334,7 @@ impl ProbeControl {
         let target = estimate * scale;
 
         // Already probed at max rate; no point probing again.
-        let max = desired * MAX_PROBE_BITRATE_FACTOR;
+        let max = (desired * MAX_PROBE_BITRATE_FACTOR).min(self.ceiling);
         if target >= max && last.further >= max * self.config.further_probe_threshold {
             return false;
         }
@@ -536,7 +546,7 @@ impl ProbeControl {
 
     fn queue_probe(&mut self, bitrate: Bitrate, kind: ProbeKind, desired: Bitrate, now: Instant) {
         // Cap at 2× desired bitrate.
-        let max = desired * MAX_PROBE_BITRATE_FACTOR;
+        let max = (desired * MAX_PROBE_BITRATE_FACTOR).min(self.ceiling);
         let bitrate = bitrate.min(max);
 
         // No probe at too small values.

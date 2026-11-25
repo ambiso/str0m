@@ -165,10 +165,10 @@ impl Session {
         while *id > MAX_ID {
             id = (*id >> 1).into();
         }
-        let (pacer, bwe) = if let Some(config) = &config.bwe_config {
-            let rate = config.initial_bitrate;
-            let pacer = PacerImpl::leaky_bucket(rate * 2.0);
-            let bwe = Bwe::new(rate);
+        let (pacer, bwe) = if let Some(bwe_config) = &config.bwe_config {
+            let rate = bwe_config.initial_bitrate;
+            let pacer = PacerImpl::leaky_bucket(rate * 2.0, config.bwe_sustained_delivery);
+            let bwe = Bwe::new(rate).with_sustained_delivery(config.bwe_sustained_delivery);
             (pacer, Some(bwe))
         } else {
             (PacerImpl::null(), None)
@@ -206,7 +206,11 @@ impl Session {
             bwe_last_event: None,
             enable_twcc_feedback: false,
             pacer,
-            pacer_control: PacerControl::new(),
+            pacer_control: if config.bwe_sustained_delivery {
+                PacerControl::for_sustained_video()
+            } else {
+                PacerControl::new()
+            },
             poll_packet_buf: vec![0; 2000],
             pending_packet: None,
             media_bytes_rx: 0,

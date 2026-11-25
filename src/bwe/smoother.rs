@@ -28,17 +28,29 @@ impl EstimateSmoother {
 
     /// Record a new estimate and update the smoothed average.
     pub fn record(&mut self, now: Instant, estimate: Bitrate) {
+        self.record_for(now, estimate, ESTIMATE_WINDOW);
+    }
+
+    pub fn record_for(&mut self, now: Instant, estimate: Bitrate, window: Duration) {
         // Did value change from previous?
         let do_update = self.estimates.back().map(|b| b.1) != Some(estimate);
 
         if do_update {
+            // Keep increases smoothed. A material drop starts a new window
+            // so an encoder can follow the reduced pacing rate immediately.
+            if self
+                .emitted
+                .is_some_and(|rate| estimate < rate * (1.0 - TOLERANCE))
+            {
+                self.estimates.clear();
+            }
             self.maybe_emit = true;
             self.estimates.push_back((now, estimate));
         }
 
         // Remove entries older than the window.
         while let Some((time, _)) = self.estimates.front() {
-            if now.duration_since(*time) > ESTIMATE_WINDOW {
+            if now.duration_since(*time) > window {
                 // Keep last entry
                 if self.estimates.len() == 1 {
                     break;
@@ -93,4 +105,23 @@ fn in_tolerance(b1: Bitrate, b2: Bitrate) -> bool {
     let min = b1 * (1.0 - TOLERANCE);
     let max = b1 * (1.0 + TOLERANCE);
     b2 > min && b2 < max
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_decreases_emit_before_the_old_window_expires() {
+        let mut smoother = EstimateSmoother::new();
+        let now = Instant::now();
+        smoother.record(now, Bitrate::bps(56_000_000));
+        assert_eq!(smoother.poll(), Some(Bitrate::bps(56_000_000)));
+        smoother.record(now + Duration::from_millis(100), Bitrate::bps(64_000_000));
+        assert_eq!(smoother.poll(), Some(Bitrate::bps(60_000_000)));
+        smoother.record(now + Duration::from_millis(200), Bitrate::bps(9_000_000));
+        assert_eq!(smoother.poll(), Some(Bitrate::bps(9_000_000)));
+        smoother.record(now + Duration::from_millis(300), Bitrate::bps(15_000_000));
+        assert_eq!(smoother.poll(), Some(Bitrate::bps(12_000_000)));
+    }
 }

@@ -18,11 +18,21 @@ pub(crate) struct PacingResult {
 }
 
 /// Controls the pacing and padding rates.
-pub(crate) struct PacerControl {}
+pub(crate) struct PacerControl {
+    factor: f64,
+}
 
 impl PacerControl {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            factor: PACING_FACTOR,
+        }
+    }
+
+    /// Keep headroom for packet headers and retransmissions while an SFU
+    /// publisher adapts its encoder to the measured rate.
+    pub fn for_sustained_video() -> Self {
+        Self { factor: 0.85 }
     }
 
     pub fn calculate(
@@ -47,7 +57,7 @@ impl PacerControl {
         // Set pacing rate to smooth out media transmission (burst avoidance).
         // Must be at least the current BWE estimate * factor, but also high enough
         // to allow the padding we want to send.
-        let min_pacing_rate = estimate * PACING_FACTOR;
+        let min_pacing_rate = estimate * self.factor;
         let pacing_rate = min_pacing_rate.max(padding_rate);
 
         PacingResult {
